@@ -1,3 +1,39 @@
+"""
+Gateway-aware drop-in replacement for mspasspy.client.Client.
+
+This preserves the original MsPASS Client public API (get_scheduler,
+get_database, get_database_client, get_global_history_manager,
+set_database_client, set_global_history_manager, set_scheduler) and the
+original constructor-parameter / environment-variable / default resolution
+priority. It ADDS a Dask Gateway connection path so MsPASS can run against a
+Gateway-provisioned, per-user, Kubernetes cluster (e.g. EarthScope GeoLab)
+instead of only a bare LocalCluster or a raw tcp:// scheduler address.
+
+Backwards compatibility:
+  * If no Gateway is configured/available, behavior is identical to upstream:
+      - scheduler_host / MSPASS_SCHEDULER_ADDRESS  -> DaskClient("host:port")
+      - neither set                                -> DaskClient()  (LocalCluster)
+  * The MongoDBWorker plugin is still auto-registered on the resulting client.
+
+Gateway activation (dask scheduler only) happens when EITHER:
+  * use_gateway=True is passed explicitly, OR
+  * use_gateway is None (default) AND the environment looks like Gateway
+    (DASK_GATEWAY__ADDRESS present) AND no explicit raw scheduler address was
+    requested via scheduler_host / MSPASS_SCHEDULER_ADDRESS.
+
+New constructor parameters (all optional, all keyword-friendly):
+  use_gateway      : True / False / None(auto-detect). Default None.
+  gateway_address  : override DASK_GATEWAY__ADDRESS.
+  gateway_proxy_address : override DASK_GATEWAY__PROXY_ADDRESS.
+  gateway_auth     : override auth type (default reads DASK_GATEWAY__AUTH__TYPE,
+                     falls back to "jupyterhub").
+  cluster_options  : dict of options passed to gateway.new_cluster(**options).
+  adapt_minimum    : adaptive scaling floor (default 0).
+  adapt_maximum    : adaptive scaling ceiling (default 8).
+  reuse_existing   : reconnect to this user's existing Gateway cluster if one
+                     exists instead of creating a new one (default True).
+"""
+
 import os
 import pymongo
 
@@ -25,20 +61,29 @@ try:
 except ImportError:
     _mspasspy_has_dask_distributed = False
 
+try:
+    from dask_gateway import Gateway
+
+    _mspasspy_has_dask_gateway = True
+except ImportError:
+    _mspasspy_has_dask_gateway = False
+
 from mspasspy.ccore.utility import MsPASSError
 
 
 class Client:
     """
-    A client-side representation of MSPASS.
+    A client-side representation of MSPASS (Gateway-aware).
 
-    This is the only client users should use in MSPASS. The client manages all the other clients or instances.
-    It creates and manages a Database client.
-    It creates and manages a Global Hisotry Manager.
-    It creates and manages a scheduler(spark/dask)
+    This is the only client users should use in MSPASS. The client manages all
+    the other clients or instances. It creates and manages a Database client, a
+    Global History Manager, and a scheduler (spark/dask). When a Dask Gateway is
+    configured in the environment, the dask scheduler is obtained from a
+    per-user Gateway cluster rather than a LocalCluster.
 
-    For the address and port of each client/instances, we first check the user specified parameters, if not then
-    serach the environment varibales values, if not againm then use the default settings.
+    For the address and port of each client/instance we first check the
+    user-specified parameters, then environment variable values, then the
+    default settings.
     """
 
     def __init__(
@@ -50,8 +95,17 @@ class Client:
         database_name="mspass",
         schema=None,
         collection=None,
+        # ---- new Gateway-related keyword args (all optional) ----
+        use_gateway=None,
+        gateway_address=None,
+        gateway_proxy_address=None,
+        gateway_auth=None,
+        cluster_options=None,
+        adapt_minimum=0,
+        adapt_maximum=8,
+        reuse_existing=True,
     ):
-        # job_name should be a string
+        # ---- original validation (unchanged) ----
         if database_host is not None and not type(database_host) is str:
             raise MsPASSError(
                 "database_host should be a string but "
@@ -85,7 +139,6 @@ class Client:
                 + " is found.",
                 "Fatal",
             )
-        # collection should be a string
         if collection is not None and type(collection) is not str:
             raise MsPASSError(
                 "collection should be a string but "
@@ -94,7 +147,20 @@ class Client:
                 "Fatal",
             )
 
-        # check env variables
+        # ---- stash Gateway-related settings for later use ----
+        self._use_gateway = use_gateway
+        self._gateway_address = gateway_address
+        self._gateway_proxy_address = gateway_proxy_address
+        self._gateway_auth = gateway_auth
+        self._cluster_options = cluster_options or {}
+        self._adapt_minimum = adapt_minimum
+        self._adapt_maximum = adapt_maximum
+        self._reuse_existing = reuse_existing
+        # Handles populated only on the Gateway path; kept for teardown/inspection.
+        self._gateway = None
+        self._gateway_cluster = None
+
+        # ---- check env variables (unchanged) ----
         MSPASS_DB_ADDRESS = os.environ.get("MSPASS_DB_ADDRESS")
         MONGODB_PORT = os.environ.get("MONGODB_PORT")
         MSPASS_SCHEDULER = os.environ.get("MSPASS_SCHEDULER")
@@ -102,20 +168,16 @@ class Client:
         DASK_SCHEDULER_PORT = os.environ.get("DASK_SCHEDULER_PORT")
         SPARK_MASTER_PORT = os.environ.get("SPARK_MASTER_PORT")
 
-        # create a database client
-        # priority: parameter -> env -> default
+        # ---- database client (unchanged) ----
         database_host_has_port = False
         if database_host:
             database_address = database_host
-            # check if database_host contains port number already
             if ":" in database_address:
                 database_host_has_port = True
-
         elif MSPASS_DB_ADDRESS:
             database_address = MSPASS_DB_ADDRESS
         else:
             database_address = "127.0.0.1"
-        # add port
         if not database_host_has_port and MONGODB_PORT:
             database_address += ":" + MONGODB_PORT
 
@@ -129,12 +191,11 @@ class Client:
                 "Fatal",
             )
 
-        # set default database name
+        # ---- defaults + global history manager (unchanged) ----
         self._default_database_name = database_name
         self._default_schema = schema
         self._default_collection = collection
 
-        # create a Global History Manager
         if schema:
             global_history_manager_db = Database(
                 self._db_client, database_name, db_schema=schema
@@ -145,7 +206,7 @@ class Client:
             global_history_manager_db, job_name, collection=collection
         )
 
-        # set scheduler
+        # ---- choose scheduler type (unchanged priority) ----
         if scheduler:
             self._scheduler = scheduler
         elif MSPASS_SCHEDULER:
@@ -158,30 +219,22 @@ class Client:
             else:
                 self._scheduler = None
 
-        # scheduler configuration
+        # ---- spark path (unchanged) ----
         if self._scheduler == "spark":
             scheduler_host_has_port = False
             if scheduler_host:
                 self._spark_master_url = scheduler_host
-                # add spark:// prefix if not exist
                 if "spark://" not in scheduler_host:
                     self._spark_master_url = "spark://" + self._spark_master_url
-                # check if spark host address contains port number already
                 if self._spark_master_url.count(":") == 2:
                     scheduler_host_has_port = True
-
             elif MSPASS_SCHEDULER_ADDRESS:
                 self._spark_master_url = MSPASS_SCHEDULER_ADDRESS
-                # add spark:// prefix if not exist
                 if "spark://" not in MSPASS_SCHEDULER_ADDRESS:
                     self._spark_master_url = "spark://" + self._spark_master_url
             else:
                 self._spark_master_url = "local"
 
-            # add port number
-            # 1. not the default 'local'
-            # 2. scheduler_host and does not contain port number
-            # 3. SPARK_MASTER_PORT exists
             if (
                 (scheduler_host or MSPASS_SCHEDULER_ADDRESS)
                 and not scheduler_host_has_port
@@ -189,7 +242,6 @@ class Client:
             ):
                 self._spark_master_url += ":" + SPARK_MASTER_PORT
 
-            # sanity check
             try:
                 spark = (
                     SparkSession.builder.appName("mspass")
@@ -205,27 +257,32 @@ class Client:
                 )
 
         elif self._scheduler == "dask":
-            # if no defind scheduler_host and no MSPASS_SCHEDULER_ADDRESS, use local cluster to create a client
-            if not scheduler_host and not MSPASS_SCHEDULER_ADDRESS:
+            # Decide whether to use Gateway. An explicit raw address (param or
+            # env) always wins and takes the original tcp:// path, preserving
+            # backward compatibility.
+            explicit_raw_address = bool(scheduler_host or MSPASS_SCHEDULER_ADDRESS)
+            gateway_wanted = self._resolve_use_gateway(explicit_raw_address)
+
+            if gateway_wanted:
+                # ---- NEW: Dask Gateway path ----
+                self._dask_client = self._connect_via_gateway()
+            elif not explicit_raw_address:
+                # ---- original LocalCluster fallback ----
                 self._dask_client = DaskClient()
             else:
+                # ---- original raw tcp:// path ----
                 scheduler_host_has_port = False
-                # set host
                 if scheduler_host:
                     self._dask_client_address = scheduler_host
-                    # check if scheduler_host contains port number already
                     if ":" in scheduler_host:
                         scheduler_host_has_port = True
                 else:
                     self._dask_client_address = MSPASS_SCHEDULER_ADDRESS
 
-                # add port
                 if not scheduler_host_has_port and DASK_SCHEDULER_PORT:
                     self._dask_client_address += ":" + DASK_SCHEDULER_PORT
                 else:
-                    # use to port 8786 by default if not specified
                     self._dask_client_address += ":8786"
-                # sanity check
                 try:
                     self._dask_client = DaskClient(self._dask_client_address)
                 except Exception as err:
@@ -237,11 +294,125 @@ class Client:
         else:
             print("There is no spark or dask installed, this client has no scheduler")
 
-        # Auto-register MongoDB worker plugin for dask to avoid DB serialization leaks
+        # ---- auto-register MongoDB worker plugin (unchanged) ----
         if self._scheduler == "dask":
             mongo_plugin = MongoDBWorker(self, dbclient_key="dbclient")
             self._dask_client.register_plugin(mongo_plugin, name="mongodb_worker")
 
+    # ------------------------------------------------------------------ #
+    # Gateway helpers (new)
+    # ------------------------------------------------------------------ #
+    def _resolve_use_gateway(self, explicit_raw_address):
+        """Decide whether the dask scheduler should come from Dask Gateway.
+
+        Rules:
+          * use_gateway=True  -> require Gateway (error if unavailable).
+          * use_gateway=False -> never use Gateway.
+          * use_gateway=None  -> auto: use Gateway iff dask_gateway is importable,
+            a Gateway address is configured (param or DASK_GATEWAY__ADDRESS), and
+            the caller did NOT request an explicit raw tcp scheduler address.
+        """
+        addr_configured = bool(
+            self._gateway_address or os.environ.get("DASK_GATEWAY__ADDRESS")
+        )
+
+        if self._use_gateway is True:
+            if not _mspasspy_has_dask_gateway:
+                raise MsPASSError(
+                    "use_gateway=True but the dask_gateway package is not installed.",
+                    "Fatal",
+                )
+            if not addr_configured:
+                raise MsPASSError(
+                    "use_gateway=True but no Gateway address is configured "
+                    "(set gateway_address or DASK_GATEWAY__ADDRESS).",
+                    "Fatal",
+                )
+            return True
+
+        if self._use_gateway is False:
+            return False
+
+        # auto-detect
+        return (
+            _mspasspy_has_dask_gateway
+            and addr_configured
+            and not explicit_raw_address
+        )
+
+    def _connect_via_gateway(self):
+        """Create or reuse a per-user Gateway cluster and return its DaskClient.
+
+        Address, proxy address, auth type, worker image and worker environment
+        are read from the DASK_GATEWAY__* environment variables by dask_gateway
+        unless overridden via constructor parameters. On GeoLab these env vars
+        are injected into the singleuser pod, so Gateway() with no args resolves
+        correctly; we pass overrides only when provided.
+        """
+        gw_kwargs = {}
+        if self._gateway_address:
+            gw_kwargs["address"] = self._gateway_address
+        if self._gateway_proxy_address:
+            gw_kwargs["proxy_address"] = self._gateway_proxy_address
+
+        # Auth: default to the env-configured type (jupyterhub on GeoLab).
+        auth = self._gateway_auth or os.environ.get(
+            "DASK_GATEWAY__AUTH__TYPE", "jupyterhub"
+        )
+        if auth:
+            gw_kwargs["auth"] = auth
+
+        try:
+            self._gateway = Gateway(**gw_kwargs)
+        except Exception as err:
+            raise MsPASSError(
+                "Runntime error: cannot create a Dask Gateway handle: " + str(err),
+                "Fatal",
+            )
+
+        # Reconnect to an existing per-user cluster if asked and one exists.
+        cluster = None
+        try:
+            if self._reuse_existing:
+                existing = self._gateway.list_clusters()
+                if existing:
+                    cluster = self._gateway.connect(existing[0].name)
+            if cluster is None:
+                cluster = self._gateway.new_cluster(**self._cluster_options)
+        except Exception as err:
+            raise MsPASSError(
+                "Runntime error: cannot create or connect to a Gateway cluster: "
+                + str(err),
+                "Fatal",
+            )
+
+        self._gateway_cluster = cluster
+
+        # Adaptive scaling: minimum=0 keeps idle clusters cheap; maximum is
+        # clamped server-side by the Gateway ClusterConfig limits.
+        try:
+            cluster.adapt(minimum=self._adapt_minimum, maximum=self._adapt_maximum)
+        except Exception:
+            # Non-fatal: a cluster without adaptive support can still be used.
+            pass
+
+        try:
+            return DaskClient(cluster)
+        except Exception as err:
+            raise MsPASSError(
+                "Runntime error: cannot create a dask client from the Gateway "
+                "cluster: " + str(err),
+                "Fatal",
+            )
+
+    def get_gateway_cluster(self):
+        """Return the underlying Gateway cluster object, or None if not using
+        Gateway. Useful for scaling, logs (cluster.shutdown(), etc.)."""
+        return self._gateway_cluster
+
+    # ------------------------------------------------------------------ #
+    # Original API (unchanged)
+    # ------------------------------------------------------------------ #
     def get_database_client(self):
         """
         Get the database client in the global history manager
@@ -297,19 +468,15 @@ class Client:
         """
         database_host_has_port = False
         database_address = database_host
-        # check if port is already in the database_host address
         if ":" in database_host:
             database_host_has_port = True
-        # add port
         if not database_host_has_port and database_port:
             database_address += ":" + database_port
-        # sanity check
         temp_db_client = self._db_client
         try:
             self._db_client = DBClient(database_address)
             self._db_client.server_info()
         except Exception as err:
-            # restore the _db_client
             self._db_client = temp_db_client
             raise MsPASSError(
                 "Runntime error: cannot create a database client with: "
@@ -349,13 +516,18 @@ class Client:
             history_db, job_name, collection=collection
         )
 
-    def set_scheduler(self, scheduler, scheduler_host, scheduler_port=None):
+    def set_scheduler(self, scheduler, scheduler_host=None, scheduler_port=None):
         """
-        Set a scheduler by scheduler type, scheduler_host(and scheduler_port)
+        Set a scheduler by scheduler type, scheduler_host(and scheduler_port).
+
+        Extended for Gateway: if scheduler == "dask" and scheduler_host is None
+        or the literal "gateway", a Dask Gateway cluster is created/reused using
+        the same environment-driven configuration as the constructor.
 
         :param scheduler: the scheduler type, should be either dask or spark
         :type scheduler: :class:`str`
-        :param scheduler_host: the host address of scheduler
+        :param scheduler_host: the host address of scheduler, or None/"gateway"
+            to use Dask Gateway for a dask scheduler
         :type scheduler_host: :class:`str`
         :param scheduler_port: the port of scheduler
         :type scheduler_port: :class:`str`
@@ -371,21 +543,20 @@ class Client:
         prev_scheduler = self._scheduler
         self._scheduler = scheduler
         if scheduler == "spark":
+            if scheduler_host is None:
+                raise MsPASSError(
+                    "set_scheduler: scheduler_host is required for spark.",
+                    "Fatal",
+                )
             scheduler_host_has_port = False
-
             self._spark_master_url = scheduler_host
-            # add spark:// prefix if not exist
             if "spark://" not in scheduler_host:
                 self._spark_master_url = "spark://" + self._spark_master_url
-            # check if spark host address contains port number already
             if self._spark_master_url.count(":") == 2:
                 scheduler_host_has_port = True
-
-            # add port
             if not scheduler_host_has_port and scheduler_port:
                 self._spark_master_url += ":" + scheduler_port
 
-            # sanity check
             prev_spark_context = None
             prev_spark_conf = None
             if hasattr(self, "_spark_context"):
@@ -395,7 +566,6 @@ class Client:
                 if hasattr(self, "_spark_context") and isinstance(
                     self._spark_context, SparkContext
                 ):
-                    # update the confinguration
                     spark_conf = self._spark_context._conf.setMaster(
                         self._spark_master_url
                     )
@@ -405,18 +575,11 @@ class Client:
                         .setAppName("mspass")
                         .setMaster(self._spark_master_url)
                     )
-                # stop the previous spark context
-                # FIXME if the new context does not start, we shouldn't stop the previous here.
-                # if prev_spark_context:
-                #    prev_spark_context.stop()
-                # create a new spark context -> might cause error so that execute exception code
                 spark = SparkSession.builder.config(conf=spark_conf).getOrCreate()
                 self._spark_context = spark.sparkContext
             except Exception as err:
-                # restore the spark context by the previous spark configuration
                 if prev_spark_conf:
                     self._spark_context = SparkContext.getOrCreate(conf=prev_spark_conf)
-                # restore the scheduler type
                 if self._scheduler == "spark" and prev_scheduler == "dask":
                     self._scheduler = prev_scheduler
                 raise MsPASSError(
@@ -424,44 +587,51 @@ class Client:
                     + self._spark_master_url,
                     "Fatal",
                 )
-            # close previous dask client if success
             if hasattr(self, "_dask_client"):
                 del self._dask_client
 
         elif scheduler == "dask":
-            scheduler_host_has_port = False
-            self._dask_client_address = scheduler_host
-            # check if scheduler_host contains port number already
-            if ":" in scheduler_host:
-                scheduler_host_has_port = True
-
-            # add port
-            if not scheduler_host_has_port:
-                if scheduler_port:
-                    self._dask_client_address += ":" + scheduler_port
-                else:
-                    # use to port 8786 by default if not specified
-                    self._dask_client_address += ":8786"
-
-            # sanity check
             prev_dask_client = None
             if hasattr(self, "_dask_client"):
                 prev_dask_client = self._dask_client
+
+            # Gateway path: scheduler_host omitted or explicitly "gateway".
+            use_gw = scheduler_host is None or scheduler_host == "gateway"
             try:
-                # create a new dask client
-                self._dask_client = DaskClient(self._dask_client_address)
+                if use_gw:
+                    self._dask_client = self._connect_via_gateway()
+                else:
+                    scheduler_host_has_port = False
+                    self._dask_client_address = scheduler_host
+                    if ":" in scheduler_host:
+                        scheduler_host_has_port = True
+                    if not scheduler_host_has_port:
+                        if scheduler_port:
+                            self._dask_client_address += ":" + scheduler_port
+                        else:
+                            self._dask_client_address += ":8786"
+                    self._dask_client = DaskClient(self._dask_client_address)
             except Exception as err:
-                # restore the dask client if exists
                 if prev_dask_client:
                     self._dask_client = prev_dask_client
-                # restore the scheduler type
                 if self._scheduler == "dask" and prev_scheduler == "spark":
                     self._scheduler = prev_scheduler
                 raise MsPASSError(
-                    "Runntime error: cannot create a dask client with: "
-                    + self._dask_client_address,
+                    "Runntime error: cannot create a dask client (Gateway="
+                    + str(use_gw)
+                    + "): "
+                    + str(err),
                     "Fatal",
                 )
-            # remove previous spark context if success setting new dask client
+
+            # Re-register the MongoDB worker plugin on the new client.
+            try:
+                mongo_plugin = MongoDBWorker(self, dbclient_key="dbclient")
+                self._dask_client.register_plugin(
+                    mongo_plugin, name="mongodb_worker"
+                )
+            except Exception:
+                pass
+
             if hasattr(self, "_spark_context"):
                 del self._spark_context

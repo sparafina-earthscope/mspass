@@ -196,6 +196,11 @@ ADD setup.py /mspass/setup.py
 ADD pyproject.toml /mspass/pyproject.toml
 ADD python /mspass/python
 ADD .git /mspass/.git
+# Override the upstream MsPASS client with the Gateway-aware version so that
+# mspass_client.get_scheduler() connects to the per-user Dask Gateway cluster
+# on GeoLab instead of spawning an in-pod LocalCluster. Must come before the
+# pip install below so this file is what lands in site-packages.
+COPY client.py /mspass/python/mspasspy/client.py
 RUN pip3 install /mspass -v \
 	&& rm -rf /mspass/build /mspass/.git && docker-clean
 
@@ -222,7 +227,15 @@ RUN python -c "import site; print(site.getsitepackages()[0])" > site_packages_pa
 	rm site_packages_path.txt
 
 # install Dask JupyterLab extension
-RUN pip install dask-labextension dask-gateway && docker-clean
+# dask-gateway releases on its own cadence (no per-dask-release version), so it
+# is pinned to the latest available release rather than to the dask version.
+# What must stay aligned is this client's dask-gateway vs. the GeoLab Gateway
+# *server* version, and client-vs-worker dask/distributed (guaranteed here since
+# workers reuse this same image via DASK_GATEWAY__CLUSTER__OPTIONS__IMAGE).
+RUN pip install dask-labextension \
+	"dask-gateway==2026.3.0" \
+	"dask[distributed]==2026.6.0" \
+	&& docker-clean
 
 ENV PATH="${SPARK_HOME}/bin:${SPARK_HOME}/sbin:${PATH}"
 
