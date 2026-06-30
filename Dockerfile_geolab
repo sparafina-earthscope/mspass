@@ -200,7 +200,7 @@ ADD .git /mspass/.git
 # mspass_client.get_scheduler() connects to the per-user Dask Gateway cluster
 # on GeoLab instead of spawning an in-pod LocalCluster. Must come before the
 # pip install below so this file is what lands in site-packages.
-COPY client.py /mspass/python/mspasspy/client.py
+# COPY client.py /mspass/python/mspasspy/client.py
 RUN pip3 install /mspass -v \
 	&& rm -rf /mspass/build /mspass/.git && docker-clean
 
