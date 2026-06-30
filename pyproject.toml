@@ -31,7 +31,7 @@ dependencies = [
     "botocore",
     "moto",
     "requests",
-    "earthscope-sdk==1.2.0",
+    "earthscope-sdk",
     "xarray",
     "zarr",
     "pandas>=2.3.3",
